@@ -1,0 +1,17 @@
+/.gradle/
+/.kotlin/
+/build/
+/app/build/
+/local.properties
+/.idea/
+*.iml
+.env
+.env.*
+*.jks
+*.keystore
+*.p12
+*.key
+/verification/*
+!/verification/RESULTS.md
+!/verification/phase1-login.png
+!/verification/phase1-tasks.png
