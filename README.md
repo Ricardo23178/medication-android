@@ -1,6 +1,6 @@
 # 安心用药 · Android 客户端
 
-用药提醒系统的 Android 端，Kotlin + Jetpack Compose + MVVM 实现，对接自研 Spring Boot 后端。与 [HarmonyOS 端](https://github.com/Ricardo23178/medication-reminder-app) 共用同一套 REST 接口，两端分别落地。
+用药提醒系统的 Android 端，Kotlin + Jetpack Compose + MVVM 实现，对接自研 Spring Boot 后端。与 [HarmonyOS 端](https://github.com/Ricardo23178/medication-harmony) 共用同一套 REST 接口，两端分别落地。
 
 ## 功能范围
 
@@ -60,7 +60,7 @@ git clone https://github.com/Ricardo23178/medication-android.git
 
 用 Android Studio 打开工程根目录，按提示安装对应 Android SDK 与 JDK，首次 Sync 会下载 Gradle 依赖。`local.properties` 由 IDE 生成，不要提交。
 
-启动后端（[medication-reminder-backend](https://github.com/Ricardo23178/medication-reminder-backend)）后，在登录页填写地址：
+启动后端（[medication-backend](https://github.com/Ricardo23178/medication-backend)）后，在登录页填写地址：
 
 - Android 官方模拟器：`http://10.0.2.2:8080/`（10.0.2.2 指向宿主机，不要填 127.0.0.1）
 - 真机：手机与电脑同一局域网，填 `http://电脑IPv4:8080/`，并检查后端监听与防火墙
