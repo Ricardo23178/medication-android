@@ -1,5 +1,6 @@
 package com.zhusixing.medication
 
+import com.zhusixing.medication.data.InMemorySessionStore
 import com.zhusixing.medication.data.MedicationRepository
 import com.zhusixing.medication.data.RemindTask
 import com.zhusixing.medication.data.RepositoryException
@@ -260,6 +261,64 @@ class MedicationViewModelTest {
         assertEquals(next, vm.state.value.session)
         assertEquals(88L, vm.state.value.tasks.single().id)
         assertNull(vm.state.value.error)
+    }
+
+    @Test fun savedSessionIsRestoredOnColdStart() = runTest {
+        val store = InMemorySessionStore(session)
+        val fake = FakeRepository(session).apply { load = { listOf(waiting) } }
+        val vm = MedicationViewModel(fake, store)
+        assertTrue(vm.state.value.restoring)
+        advanceUntilIdle()
+        assertEquals(session, vm.state.value.session)
+        assertEquals(listOf(waiting), vm.state.value.tasks)
+        assertFalse(vm.state.value.restoring)
+        assertFalse(vm.state.value.loading)
+    }
+
+    @Test fun expiredSavedSessionFallsBackToLoginAndClearsStorage() = runTest {
+        val store = InMemorySessionStore(session)
+        val fake = FakeRepository(session).apply {
+            load = { throw RepositoryException("登录已失效，请重新登录", sessionExpired = true) }
+        }
+        val vm = MedicationViewModel(fake, store)
+        advanceUntilIdle()
+        assertNull(vm.state.value.session)
+        assertEquals("登录已失效，请重新登录", vm.state.value.error)
+        assertFalse(vm.state.value.restoring)
+        assertNull(store.load())
+    }
+
+    @Test fun networkFailureOnColdStartKeepsSavedSession() = runTest {
+        val store = InMemorySessionStore(session)
+        val fake = FakeRepository(session).apply {
+            load = { throw RepositoryException("无法连接后端，请检查地址、网络和服务是否启动") }
+        }
+        val vm = MedicationViewModel(fake, store)
+        advanceUntilIdle()
+        // 后端没开只是暂时不可用，不是令牌失效：会话必须留着，否则用户要重敲地址和账号。
+        assertEquals(session, vm.state.value.session)
+        assertEquals(session, store.load())
+        assertEquals("无法连接后端，请检查地址、网络和服务是否启动", vm.state.value.error)
+        assertFalse(vm.state.value.loading)
+        assertFalse(vm.state.value.restoring)
+    }
+
+    @Test fun successfulLoginPersistsSessionWithoutPassword() = runTest {
+        val store = InMemorySessionStore()
+        val vm = MedicationViewModel(FakeRepository(session), store)
+        vm.login(session.baseUrl, "alice", "password")
+        advanceUntilIdle()
+        assertEquals(session, store.load())
+    }
+
+    @Test fun logoutClearsPersistedSession() = runTest {
+        val store = InMemorySessionStore(session)
+        val vm = MedicationViewModel(FakeRepository(session), store)
+        advanceUntilIdle()
+        vm.logout()
+        advanceUntilIdle()
+        assertNull(vm.state.value.session)
+        assertNull(store.load())
     }
 
     private class FakeRepository(private val initialSession: Session) : MedicationRepository {
