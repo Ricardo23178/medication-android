@@ -15,7 +15,9 @@
 | 语言 | Kotlin |
 | UI | Jetpack Compose + Material 3（Scaffold、LazyColumn、Card、TextField） |
 | 状态 | ViewModel + StateFlow（内部持有 MutableStateFlow，对外暴露只读） |
-| 网络 | Retrofit + OkHttp + Kotlin 协程 |
+| 网络 | Retrofit + OkHttp + Kotlin 协程；鉴权与地址改写由拦截器统一处理 |
+| 会话 | DataStore Preferences 持久化，冷启动自动恢复；密码不落盘 |
+| 依赖装配 | 手写 `AppContainer`（构造器注入）。Hilt 与 AGP 9 的内置 Kotlin 冲突，取舍见 [docs/plan-phase2.md](docs/plan-phase2.md) |
 | 测试 | JUnit + FakeRepository + MockWebServer |
 | 构建 | Gradle（AGP 9.3、Kotlin 2.4，minSdk 26、targetSdk 36） |
 
@@ -23,14 +25,23 @@
 
 ```
 app/src/main/java/com/zhusixing/medication/
-├── MainActivity.kt                  # 入口，setContent 挂载 Compose
+├── MedicationApplication.kt          # 进程入口，持有 AppContainer
+├── MainActivity.kt                   # 入口，setContent 挂载 Compose
+├── di/
+│   └── AppContainer.kt               # OkHttp / Retrofit / Repository / SessionStore 的唯一实例
 ├── data/
-│   ├── Models.kt                    # 请求 / 任务 / Session 数据类
-│   ├── MedicationRepository.kt      # 接口定义（suspend 函数）
-│   └── HttpMedicationRepository.kt  # Retrofit 实现，HTTP 状态与业务 code 双重判断
+│   ├── Models.kt                     # 请求 / 任务 / Session 数据类
+│   ├── MedicationRepository.kt       # 接口定义（suspend 函数）
+│   ├── HttpMedicationRepository.kt   # Retrofit 实现，HTTP 状态与业务 code 双重判断
+│   ├── NetworkFactory.kt             # 拦截器链与 Retrofit 的组装配方（测试复用同一套）
+│   ├── SessionHolder.kt              # 单次请求的地址与令牌，作为请求标签下发
+│   ├── ApiInterceptors.kt            # 地址改写 + 鉴权头注入
+│   └── SessionStore.kt               # DataStore 持久化会话
+├── reminders/
+│   └── ReminderPolicy.kt             # 本地提醒的排程判定（阶段 2）
 └── ui/
-    ├── MedicationViewModel.kt       # 状态持有 + 三个动作 login / loadToday / confirm|skip
-    └── MedicationApp.kt             # 页面读取 StateFlow，点击事件回调 ViewModel
+    ├── MedicationViewModel.kt        # 状态持有 + login / refresh / confirm / logout / 冷启动恢复
+    └── MedicationApp.kt              # 页面读取 StateFlow，点击事件回调 ViewModel
 ```
 
 单向数据流：**点击 → ViewModel → Repository → REST → 更新 StateFlow → Compose 重组**。视图层不直接发请求。
@@ -49,7 +60,8 @@ app/src/main/java/com/zhusixing/medication/
 
 - **重复提交**：以 `busyTaskId` 标记在途任务，点击瞬间置位，同一条任务不会被重复确认；请求结束再复位。
 - **生命周期**：请求在 `viewModelScope` 内启动，页面销毁随之取消，不会向已销毁的界面回写状态。
-- **会话**：只存在内存，旋转屏幕由 ViewModel 保留，进程结束需重新登录；密码不落盘。
+- **会话**：登录成功后写入 DataStore，冷启动直接进入今日任务；退出登录与服务端返回 401 都会清除本地会话。恢复失败一律退回登录页，不让人停在空壳页面上。密码不落盘。
+- **一个 Retrofit 服务所有服务器**：`baseUrl` 建好后不可改，而服务器地址由用户填写，所以基址固定为占位值，真正的主机与端口由 `BaseUrlInterceptor` 按请求标签改写——换服务器不必重建客户端，连接池得以复用。
 - **错误处理**：区分「HTTP 状态异常」与「响应体 code 异常」，分别提示，不吞异常。
 
 ## 运行
@@ -69,7 +81,9 @@ git clone https://github.com/Ricardo23178/medication-android.git
 
 ## 测试
 
-24 项单元测试通过，覆盖 ViewModel 状态流转、重复提交与网络响应解析；网络层用 MockWebServer，不依赖真实后端。构建与模拟器验收记录见 [verification/RESULTS.md](verification/RESULTS.md)。
+36 项单元测试通过，覆盖 ViewModel 状态流转、重复提交、会话恢复与清除、网络响应解析与请求标签；网络层用 MockWebServer，不依赖真实后端。构建与模拟器验收记录见 [verification/RESULTS.md](verification/RESULTS.md)。
+
+本次（第二阶段·工程底座）已执行：`testDebugUnitTest`（36 项，失败 0）、`lintDebug`（0 错误 / 7 条版本更新类警告）、`assembleDebug`。**未在模拟器或真机上复验冷启动恢复**，该行为目前只有单元测试与 DataStore 读写测试支撑。
 
 ## 参考
 

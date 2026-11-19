@@ -2,60 +2,60 @@ package com.zhusixing.medication.data
 
 import com.google.gson.JsonParseException
 import kotlinx.coroutines.CancellationException
-import okhttp3.OkHttpClient
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import retrofit2.Response
 import retrofit2.Retrofit
-import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.Body
 import retrofit2.http.GET
-import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
+import retrofit2.http.Tag
 import java.io.IOException
-import java.util.concurrent.TimeUnit
 
 private interface MedicationApi {
     @POST("api/auth/login")
-    suspend fun login(@Body request: LoginRequest): Response<ApiEnvelope<LoginData>>
+    suspend fun login(@Tag context: SessionHolder, @Body request: LoginRequest): Response<ApiEnvelope<LoginData>>
 
     @GET("api/reminders/today")
-    suspend fun today(@Header("Authorization") authorization: String): Response<ApiEnvelope<List<RemindTask?>>>
+    suspend fun today(@Tag context: SessionHolder): Response<ApiEnvelope<List<RemindTask?>>>
 
     @POST("api/reminders/{id}/confirm")
     suspend fun confirm(
-        @Header("Authorization") authorization: String,
+        @Tag context: SessionHolder,
         @Path("id") taskId: Long,
         @Body request: ConfirmRequest,
     ): Response<ApiEnvelope<RemindTask>>
 }
 
-class HttpMedicationRepository : MedicationRepository {
-    // 写请求由用户重试，不能在不知情时自动重发。
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
-        .callTimeout(20, TimeUnit.SECONDS)
-        .retryOnConnectionFailure(false)
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
+/**
+ * REST 实现。
+ *
+ * 鉴权头与目标地址交给 OkHttp 拦截器统一处理（见 ApiInterceptors），
+ * 这里只负责契约校验：HTTP 状态与响应体 code 都要判，数据不全不许当成功。
+ * OkHttp / Retrofit 由依赖注入提供，是进程内单例。
+ */
+class HttpMedicationRepository(
+    retrofit: Retrofit,
+) : MedicationRepository {
+
+    private val api = retrofit.create(MedicationApi::class.java)
 
     override suspend fun login(baseUrl: String, account: String, password: String): Session {
         val address = normalizeAddress(baseUrl)
         if (account.isBlank() || password.isBlank()) throw RepositoryException("请输入账号和密码")
-        val data = request { api(address).login(LoginRequest(account, password)) }
+        // 登录请求本身不带令牌；但地址必须先绑定，否则拦截器不知道发往哪台服务器。
+        val data = request { api.login(SessionHolder(address, null), LoginRequest(account, password)) }
         val user = data.user
         val token = data.token
         if (token.isNullOrBlank() || user == null || user.id <= 0 || user.account.isNullOrBlank()) {
             throw RepositoryException("登录响应不完整，请检查后端服务")
         }
-        return Session(address, token, user)
+        return Session(address.toString(), token, user)
     }
 
     override suspend fun today(session: Session): List<RemindTask> {
-        val tasks = request { api(session.baseUrl).today("Bearer ${session.token}") }
-            .map { it ?: invalidData() }
+        val tasks = request { api.today(SessionHolder(normalizeAddress(session.baseUrl), session.token)) }.map { it ?: invalidData() }
         if (tasks.any { !validTask(it) } || tasks.map { it.id }.distinct().size != tasks.size) invalidData()
         return tasks
     }
@@ -65,27 +65,20 @@ class HttpMedicationRepository : MedicationRepository {
             throw RepositoryException("确认参数无效，请刷新后重试")
         }
         val task = request(confirming = true) {
-            api(session.baseUrl).confirm("Bearer ${session.token}", taskId, ConfirmRequest(action, requestId))
+            api.confirm(SessionHolder(normalizeAddress(session.baseUrl), session.token), taskId, ConfirmRequest(action, requestId))
         }
         if (!validTask(task) || task.id != taskId || task.status != "CONFIRMED" ||
             task.confirmed != true || task.action !in setOf("TAKEN", "SKIPPED")) invalidData(confirming = true)
         return task
     }
 
-    private fun api(baseUrl: String): MedicationApi = Retrofit.Builder()
-        .baseUrl(normalizeAddress(baseUrl))
-        .client(client)
-        .addConverterFactory(GsonConverterFactory.create())
-        .build()
-        .create(MedicationApi::class.java)
-
-    private fun normalizeAddress(value: String): String {
+    private fun normalizeAddress(value: String): HttpUrl {
         val url = value.trim().toHttpUrlOrNull()
         if (url == null || url.username.isNotEmpty() || url.password.isNotEmpty() ||
             url.encodedPath != "/" || url.query != null || url.fragment != null) {
             throw RepositoryException("请输入后端根地址，例如 http://10.0.2.2:8080/")
         }
-        return url.toString()
+        return url
     }
 
     private fun validTask(task: RemindTask) = task.id > 0 && !task.status.isNullOrBlank() && task.confirmed != null

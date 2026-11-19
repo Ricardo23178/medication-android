@@ -3,6 +3,7 @@ package com.zhusixing.medication
 import com.google.gson.JsonParser
 import com.zhusixing.medication.data.*
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.async
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
@@ -12,7 +13,10 @@ import org.junit.Test
 
 class HttpMedicationRepositoryTest {
     private lateinit var server: MockWebServer
-    private val repository = HttpMedicationRepository()
+    // 与 AppModule 用同一条拦截器链，避免测试跑的和线上跑的不是同一套网络配置。
+    private val repository = HttpMedicationRepository(
+        NetworkFactory.retrofit(NetworkFactory.okHttpClient(debugLogging = false)),
+    )
     private val user = UserProfile(id = 7, account = "test-user")
     private fun session() = Session(server.url("/").toString(), "test-token", user)
     private val task = """{"id":9007199254740993,"medicineName":"虚构药品","dosagePerTime":0.125,"dosageUnit":"片","scheduledAt":"2026-10-29T23:50:00","status":"TRIGGERED","confirmed":false}"""
@@ -94,10 +98,25 @@ class HttpMedicationRepositoryTest {
         assertEquals(0, server.requestCount)
     }
 
-    @Test fun mismatchedTaskResponseIsNotAcceptedAsConfirmation() = runTest {
-        val validButWrongId = task.replace("TRIGGERED", "CONFIRMED").replace("false", "true").dropLast(1) + """,\"action\":\"TAKEN\"}"""
+    @Test fun mismatchedTaskResponseIsNotAcceptedAsConfirmation() = runTest {        val validButWrongId = task.replace("TRIGGERED", "CONFIRMED").replace("false", "true").dropLast(1) + """,\"action\":\"TAKEN\"}"""
         server.enqueue(reply(validButWrongId))
         assertTrue(failure { repository.confirm(session(), 1, "TAKEN", "id") }.outcomeUnknown)
+    }
+
+    @Test fun oneRetrofitServesDifferentHostsAfterSessionChanges() = runTest {
+        val other = MockWebServer()
+        other.start()
+        try {
+            server.enqueue(reply("[]"))
+            other.enqueue(reply("[]"))
+            repository.today(session())
+            repository.today(session().copy(baseUrl = other.url("/").toString()))
+            assertEquals(1, server.requestCount)
+            assertEquals(1, other.requestCount)
+            assertEquals("/api/reminders/today", other.takeRequest().path)
+        } finally {
+            other.shutdown()
+        }
     }
 
     @Test fun disconnectedWriteIsUncertainAndDoesNotSilentlyRetry() = runTest {
@@ -111,6 +130,43 @@ class HttpMedicationRepositoryTest {
         assertFalse(RemindTask(id = 1, status = "UNKNOWN", confirmed = false).canConfirm)
         assertFalse(RemindTask(id = 1, status = "CANCELLED", confirmed = false).canConfirm)
         assertTrue(RemindTask(id = 1, status = "TRIGGERED", confirmed = false, action = "DELAYED").canConfirm)
+    }
+
+    @Test fun concurrentSessionsNeverShareDestinationOrToken() = runTest {
+        val other = MockWebServer()
+        other.start()
+        val started = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val client = NetworkFactory.okHttpClient(debugLogging = false).newBuilder().apply {
+            interceptors().add(0, okhttp3.Interceptor { chain ->
+                if (calls.getAndIncrement() == 0) {
+                    started.countDown()
+                    check(release.await(5, java.util.concurrent.TimeUnit.SECONDS))
+                }
+                chain.proceed(chain.request())
+            })
+        }.build()
+        val concurrent = HttpMedicationRepository(NetworkFactory.retrofit(client))
+        server.enqueue(reply("[$task]"))
+        other.enqueue(reply("[$task]"))
+        other.enqueue(reply("[$task]"))
+        try {
+            val first = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).async {
+                concurrent.today(session())
+            }
+            assertTrue(started.await(5, java.util.concurrent.TimeUnit.SECONDS))
+            concurrent.today(Session(other.url("/").toString(), "other-token", user))
+            release.countDown()
+            first.await()
+            val original = server.takeRequest(1, java.util.concurrent.TimeUnit.SECONDS)
+            assertNotNull("首个请求被另一个会话改写了地址", original)
+            assertEquals("Bearer test-token", original!!.getHeader("Authorization"))
+            assertEquals("Bearer other-token", other.takeRequest().getHeader("Authorization"))
+        } finally {
+            release.countDown()
+            other.shutdown()
+        }
     }
 
     private suspend fun failure(block: suspend () -> Unit): RepositoryException {

@@ -2,10 +2,12 @@ package com.zhusixing.medication.ui
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zhusixing.medication.data.InMemorySessionStore
 import com.zhusixing.medication.data.MedicationRepository
 import com.zhusixing.medication.data.RemindTask
 import com.zhusixing.medication.data.RepositoryException
 import com.zhusixing.medication.data.Session
+import com.zhusixing.medication.data.SessionStore
 import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -14,6 +16,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
+/*
+ * 历史版本：单页面时期的「登录 + 今日任务」ViewModel。
+ *
+ * 它的职责已经拆进 SessionManager（登录态）、LoginViewModel（登录表单）与
+ * TodayViewModel（今日任务与确认），界面不再使用这个类。
+ *
+ * 暂时保留是因为 MedicationViewModelTest 的 6 个用例仍然跑在它上面，
+ * 而那些用例覆盖的「重复点击只提交一次」「结果未知保留原请求 ID」等行为，
+ * 与 TodayViewModel 是同一套逻辑。等测试迁到 TodayViewModel 之后删除本文件。
+ */
 data class PendingConfirmation(val taskId: Long, val action: String, val requestId: String)
 
 data class MedicationUiState(
@@ -24,14 +36,64 @@ data class MedicationUiState(
     val error: String? = null,
     val feedback: String? = null,
     val pendingConfirmation: PendingConfirmation? = null,
+    /** 冷启动时正在尝试恢复上次的会话，界面应先显示载入态而不是登录页。 */
+    val restoring: Boolean = false,
 )
 
-class MedicationViewModel(private val repository: MedicationRepository) : ViewModel() {
-    private val mutableState = MutableStateFlow(MedicationUiState())
+class MedicationViewModel(
+    private val repository: MedicationRepository,
+    private val sessionStore: SessionStore = InMemorySessionStore(),
+) : ViewModel() {
+
+    private val mutableState = MutableStateFlow(MedicationUiState(restoring = true))
     val state: StateFlow<MedicationUiState> = mutableState.asStateFlow()
     private var operation: Job? = null
     // 即使网络请求无法及时取消，旧会话的响应也不能覆盖新会话。
     private var sessionVersion = 0L
+
+    init {
+        restoreSession()
+    }
+
+    /**
+     * 冷启动时尝试用本地会话直接进入今日任务。
+     *
+     * 恢复阶段任何失败（令牌过期、后端换了地址、数据被清）都退回登录页而不是停在一个空壳页面上：
+     * 用户此时没有可用的交互入口，重新登录是唯一可靠的出路。
+     */
+    private fun restoreSession() {
+        viewModelScope.launch {
+            val saved = runCatching { sessionStore.load() }.getOrNull()
+            val current = mutableState.value
+            if (saved == null || current.session != null || current.loading) {
+                mutableState.value = current.copy(restoring = false)
+                return@launch
+            }
+            val version = ++sessionVersion
+            mutableState.value = MedicationUiState(session = saved, loading = true, restoring = false)
+            try {
+                val tasks = repository.today(saved)
+                if (version == sessionVersion) {
+                    mutableState.value = mutableState.value.copy(tasks = tasks, loading = false)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                if (version != sessionVersion) return@launch
+                val message = (error as? RepositoryException)?.message ?: "无法连接后端，请检查服务是否启动"
+                if (error is RepositoryException && error.sessionExpired) {
+                    // 令牌真的失效：本地会话没有价值了，清掉并退回登录页。
+                    runCatching { sessionStore.clear() }
+                    sessionVersion++
+                    mutableState.value = MedicationUiState(error = message)
+                } else {
+                    // 网络断了、后端没启动、服务器 5xx：会话本身仍然有效，不能毁掉。
+                    // 保留会话进任务页，用错误提示 + 刷新按钮让用户重试。
+                    mutableState.value = mutableState.value.copy(loading = false, error = message)
+                }
+            }
+        }
+    }
 
     fun login(baseUrl: String, account: String, password: String) {
         if (state.value.loading || state.value.session != null) return
@@ -45,6 +107,8 @@ class MedicationViewModel(private val repository: MedicationRepository) : ViewMo
             try {
                 val session = repository.login(baseUrl.trim(), account.trim(), password)
                 if (version != sessionVersion) return@launch
+                // 会话落盘失败不该阻断本次登录；只是下次冷启动要重新输入。
+                runCatching { sessionStore.save(session) }
                 mutableState.value = state.value.copy(session = session)
                 val tasks = repository.today(session)
                 if (version == sessionVersion) {
@@ -140,6 +204,7 @@ class MedicationViewModel(private val repository: MedicationRepository) : ViewMo
         if (error is RepositoryException && error.sessionExpired) {
             sessionVersion++
             mutableState.value = MedicationUiState(error = message)
+            viewModelScope.launch { runCatching { sessionStore.clear() } }
         } else {
             mutableState.value = state.value.copy(
                 loading = false,
@@ -156,5 +221,6 @@ class MedicationViewModel(private val repository: MedicationRepository) : ViewMo
         operation?.cancel()
         operation = null
         mutableState.value = MedicationUiState()
+        viewModelScope.launch { runCatching { sessionStore.clear() } }
     }
 }
