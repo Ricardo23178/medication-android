@@ -2,6 +2,45 @@
 
 用药提醒系统的 Android 端，Kotlin + Jetpack Compose + MVVM 实现，对接自研 Spring Boot 后端。与 [HarmonyOS 端](https://github.com/Ricardo23178/medication-harmony) 共用同一套 REST 接口，两端分别落地。
 
+## 这个项目是怎么长出来的
+
+三个端是先后长出来的，不是一次性生成的。本仓库是最后一块：
+
+| 时间 | 仓库 | 当时做的事 |
+| --- | --- | --- |
+| 09-30 ~ 10-29 | [medication-backend](https://github.com/Ricardo23178/medication-backend) | 13 次提交，从 JWT 骨架做到 10 个 Controller / 43 接口 |
+| 10-02 ~ 10-15 | [medication-harmony](https://github.com/Ricardo23178/medication-harmony) | 9 次提交，16 个页面，配合毕设主体 |
+| 10-30 ~ 10-31 | 本仓库，阶段一 | 只做登录 → 今日任务 → 确认服药三条主流程，见 [docs/design.md](docs/design.md) |
+| 11-18 ~ 11-19 | 本仓库，阶段二 | 按 feature 重分包，补 34 接口的 data 层与多页面架构，见 [docs/plan-phase2.md](docs/plan-phase2.md) |
+
+后端有两个 commit 值得单独说，因为是同一个设计改了两轮：
+
+```
+10-21  fix: 按计划版本隔离提醒任务与确认状态
+10-29  fix: 提醒任务按计划版本隔离并留存生成时药品快照
+```
+
+第一轮加 `planVersion` 解决「暂停后旧任务还能确认」；八天后发现药品名改了会让历史记录跟着变，补了生成时的药品快照。
+
+### 试过并否决的方案
+
+这些不是查来的，是撞上去才换路的：
+
+- **Hilt**：AGP 9.3.1 启用内置 Kotlin 支持后，`org.jetbrains.kotlin.kapt` 直接报
+  `The kapt plugin is not compatible with built-in Kotlin support`；KSP 最新只到 Kotlin 2.3，没有 2.4 版本。
+  绕开要关掉 built-in Kotlin 与 newDsl，会连带破坏 `compileSdk { version = release(37) { minorApiLevel = 1 } }` 的写法，不划算 → 改成手写 `AppContainer` 构造器注入。
+- **EncryptedSharedPreferences**：`androidx.security:security-crypto` 已废弃，引入后密钥仍要自己管 → 用 DataStore 只存 baseUrl / token / 昵称，密码不落盘，边界写在本文件「技术栈」一节。
+- **只用 WorkManager 做提醒**：最小周期 15 分钟，做不到「8:00 准时」→ 精确闹钟 + WorkManager 兜底重排。
+- **全局可变会话快照**：前台与后台请求会互相改写地址和令牌 → 改成 `SessionHolder` 作为不可变请求标签随请求下发。
+
+### 还没做完的
+
+[docs/plan-phase2.md](docs/plan-phase2.md) 阶段二的 5 个任务仍是未勾选状态：本地 `AlarmManager` 提醒通道、通知权限引导、通知点击深链、`BOOT_COMPLETED` 重排、到点验证。
+
+本端 14 条路由里还有 6 个页面是占位（计划、记录、统计、消息、家属、异常），接口已在 `ApiService` 里备好，页面没接。
+
+原则是：没有真机跑过的结论不写成「已验证」，只写实现与已知边界。
+
 ## 功能范围
 
 登录 → 今日用药任务 → 确认已服 / 跳过本次。核心闭环内的三条主流程，不依赖本地假数据，全部走真实接口。
